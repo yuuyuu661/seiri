@@ -1,6 +1,5 @@
 # reorder.py
 import os
-import asyncio
 from typing import List
 
 import discord
@@ -9,10 +8,10 @@ from discord import app_commands
 
 # ====== 環境設定 ======
 TOKEN = os.getenv("DISCORD_TOKEN")
-# 即時ギルド同期したいサーバーID（カンマ区切り可 / 未設定ならグローバル同期）
+# 即時ギルド同期（カンマ区切り可 / 未設定ならグローバル同期）
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "1398607685158440991").split(",") if x.strip().isdigit()]
 
-# このロールを持つ人は権限がなくても実行可（不要なら存在しないIDにしてOK）
+# 許可ロール（このロール所持者は「チャンネル管理」権限が無くても実行可）
 ALLOWED_ROLE_ID = 1398724601256874014
 
 intents = discord.Intents.default()
@@ -21,15 +20,15 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 
-# ====== Utils ======
+# ====== Utilities ======
 def parse_ids(s: str) -> List[int]:
     """カンマ/空白区切りのID列をパースし、重複除去（先勝ち）"""
-    items = []
+    items: List[int] = []
     for part in s.replace(",", " ").split():
         if part.isdigit():
             items.append(int(part))
     seen = set()
-    out = []
+    out: List[int] = []
     for i in items:
         if i not in seen:
             out.append(i)
@@ -42,8 +41,8 @@ async def reorder_category_by_ids(
     ordered_ids: List[int],
     place_front: bool = True,
 ) -> str:
-    """カテゴリ内で、指定ID群を先頭/末尾に寄せて並べ替える（残りは相対順維持）。
-       反映は guild.edit_channel_positions で一括更新。
+    """カテゴリ内で、指定ID群を先頭/末尾に寄せて並べ替え（残りは相対順維持）。
+       反映は Guild.bulk_edit_channels で一括更新。
     """
     # 現在のカテゴリ内チャンネル（position順）
     current = sorted(category.channels, key=lambda c: c.position)
@@ -67,7 +66,7 @@ async def reorder_category_by_ids(
     payload = [{"id": ch.id, "position": base_pos + i} for i, ch in enumerate(final_order)]
 
     try:
-        await category.guild.edit_channel_positions(payload)
+        await category.guild.bulk_edit_channels(payload, reason="Manual reorder by IDs")
     except discord.Forbidden:
         return "権限不足（Botに『チャンネルの管理 / Manage Channels』が必要です）。"
     except discord.HTTPException as e:

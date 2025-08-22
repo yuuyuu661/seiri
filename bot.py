@@ -1,5 +1,6 @@
 # reorder.py
 import os
+import asyncio
 from typing import List
 
 import discord
@@ -8,10 +9,10 @@ from discord import app_commands
 
 # ====== 環境設定 ======
 TOKEN = os.getenv("DISCORD_TOKEN")
-# 即時ギルド同期（カンマ区切り可 / 未設定ならグローバル同期）
+# 即時ギルド同期（未設定ならグローバル同期）
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "1398607685158440991").split(",") if x.strip().isdigit()]
 
-# 許可ロール（このロール所持者は「チャンネル管理」権限が無くても実行可）
+# 許可ロール（このロール所持者は権限なしでも実行可）※不要なら存在しないIDでOK
 ALLOWED_ROLE_ID = 1398724601256874014
 
 intents = discord.Intents.default()
@@ -36,15 +37,21 @@ def parse_ids(s: str) -> List[int]:
     return out
 
 
+async def safe_edit_position(ch: discord.abc.GuildChannel, pos: int, reason: str):
+    """位置更新の安定化：小休止＋例外を握りつつ継続"""
+    await ch.edit(position=pos, reason=reason)
+    await asyncio.sleep(0.3)  # 軽めにクールダウン（環境により0.2〜0.5）
+
+
 async def reorder_category_by_ids(
     category: discord.CategoryChannel,
     ordered_ids: List[int],
     place_front: bool = True,
 ) -> str:
-    """カテゴリ内で、指定ID群を先頭/末尾に寄せて並べ替え（残りは相対順維持）。
-       反映は Guild.bulk_edit_channels で一括更新。
+    """カテゴリ内で、指定ID群を先頭/末尾に寄せて並び替え（残りは相対順維持）。
+       ※ 個別 position 更新を二段階で実行して確実に反映。
     """
-    # 現在のカテゴリ内チャンネル（position順）
+    # 現在のカテゴリ内チャンネル（position順）※Forum/Mediaも含む
     current = sorted(category.channels, key=lambda c: c.position)
     id2ch = {c.id: c for c in current}
 
@@ -53,6 +60,7 @@ async def reorder_category_by_ids(
     if not valid:
         return "指定IDのうち、このカテゴリにあるチャンネルが見つかりません。"
 
+    # 並び順（Forum/Media含め“そのまま”動かす設計ならここで分岐可能）
     specified = [id2ch[cid] for cid in valid]
     remaining = [c for c in current if c.id not in set(valid)]
     final_order = (specified + remaining) if place_front else (remaining + specified)
@@ -61,16 +69,29 @@ async def reorder_category_by_ids(
     if [c.id for c in current] == [c.id for c in final_order]:
         return "すでに指定どおりの順序です。"
 
-    # カテゴリブロックの最小positionから詰め直し → 一括反映
+    # ---- 重要：二段階移動で確実に反映させる ----
+    # 1) 退避フェーズ：全チャンネルを“大きい位置”に一旦ずらす
+    #    （category 内の最小positionを基準に +1000 オフセット）
     base_pos = min(ch.position for ch in current)
-    payload = [{"id": ch.id, "position": base_pos + i} for i, ch in enumerate(final_order)]
-
+    offset = 1000
     try:
-        await category.guild.bulk_edit_channels(payload, reason="Manual reorder by IDs")
+        # 退避は“逆順”に動かすと衝突が起きにくい
+        for i, ch in enumerate(reversed(current), start=1):
+            await safe_edit_position(ch, base_pos + offset + i, reason="reorder: temp shift")
     except discord.Forbidden:
         return "権限不足（Botに『チャンネルの管理 / Manage Channels』が必要です）。"
     except discord.HTTPException as e:
-        return f"更新に失敗しました: {e}"
+        # 続行すると崩れるのでここで止める
+        return f"退避中に更新エラーが発生しました: {e}"
+
+    # 2) 確定フェーズ：目的の順で base_pos から詰め直す
+    try:
+        for i, ch in enumerate(final_order):
+            await safe_edit_position(ch, base_pos + i, reason="reorder: final order")
+    except discord.Forbidden:
+        return "権限不足（Botに『チャンネルの管理 / Manage Channels』が必要です）。"
+    except discord.HTTPException as e:
+        return f"最終反映中に更新エラーが発生しました: {e}"
 
     return f"カテゴリ **{category.name}** の順序を更新しました。"
 

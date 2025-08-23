@@ -5,7 +5,7 @@ import math
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import discord
 from discord.ext import commands
@@ -14,6 +14,7 @@ from discord import app_commands
 # ========= 環境変数 =========
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # 必須
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# 即時反映したいサーバーIDをカンマ区切りで（例: "1398607685158440991,123..."）
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "1398607685158440991").split(",") if x.strip().isdigit()]
 PRIMARY_GUILD_ID = GUILD_IDS[0] if GUILD_IDS else None
 
@@ -28,39 +29,31 @@ log = logging.getLogger("vc_text_archiver")
 DATA_DIR = "data_vc_text"
 os.makedirs(DATA_DIR, exist_ok=True)
 
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+
 # ========= Intents / Bot =========
+# 最小構成：VCテキスト（message_content）だけ読む
 intents = discord.Intents.default()
-intents.message_content = True     # VCテキストを読むため
+intents.message_content = True   # ← 開発者ポータルで MESSAGE CONTENT をONにすること
 intents.guilds = True
-intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 # ========= 設定・状態 =========
-# ギルドごとの設定
-# {
-#   guild_id: {
-#       "log_channel_id": int | None,
-#       "max_messages_per_channel": int,  # バッファ上限（分割送信にも利用）
-#   }
-# }
+# { guild_id: {"log_channel_id": int|None, "max_messages_per_channel": int} }
 guild_settings: Dict[int, Dict] = {}
-
-# 監視対象のVCテキストメッセージをチャネルごとに保持
-# { channel_id: [ {ts, author_id, author_name, content, attachments, edit, delete}, ... ] }
+# { channel_id: [ {ts, author_id, author_name, content, attachments, edited, deleted, message_id}, ... ] }
 vc_text_buffer: Dict[int, List[Dict]] = {}
-
-SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
 DEFAULT_SETTINGS = {
     "log_channel_id": None,
-    "max_messages_per_channel": 5000,   # 十分大きめ。必要なら変更可
+    "max_messages_per_channel": 5000,
 }
 
 # ========= ユーティリティ =========
-def jst(dt: datetime) -> datetime:
-    return dt.astimezone(timezone.utc).astimezone()
+def channel_file_path(channel_id: int) -> str:
+    return os.path.join(DATA_DIR, f"{channel_id}.json")
 
 def load_settings():
     global guild_settings
@@ -68,7 +61,6 @@ def load_settings():
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # intキー化
             guild_settings = {int(k): v for k, v in data.items()}
         except Exception as e:
             log.exception("設定ファイル読み込み失敗: %s", e)
@@ -89,13 +81,9 @@ def guild_conf(guild_id: int) -> Dict:
         conf = DEFAULT_SETTINGS.copy()
         guild_settings[guild_id] = conf
         save_settings()
-    # マイグレーションで欠けてたら埋める
     for k, v in DEFAULT_SETTINGS.items():
         conf.setdefault(k, v)
     return conf
-
-def channel_file_path(channel_id: int) -> str:
-    return os.path.join(DATA_DIR, f"{channel_id}.json")
 
 def append_message_to_disk(channel_id: int, record: Dict):
     path = channel_file_path(channel_id)
@@ -113,19 +101,36 @@ def append_message_to_disk(channel_id: int, record: Dict):
     except Exception as e:
         log.exception("VCテキストの書き込み失敗: %s", e)
 
+def dedup(records: List[Dict]) -> List[Dict]:
+    """message_id / ts / content / edited / deleted をキーに重複排除"""
+    seen = set()
+    out = []
+    for r in records:
+        key = (
+            r.get("message_id"),
+            r.get("ts"),
+            r.get("content"),
+            bool(r.get("edited")),
+            bool(r.get("deleted")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
 def load_channel_records(channel_id: int) -> List[Dict]:
-    # メモリとディスクを合体（重複は一旦許容）
+    """ディスク+メモリをマージし、重複を除去して返す（←修正ポイント）"""
     mem = vc_text_buffer.get(channel_id, [])
-    path = channel_file_path(channel_id)
     disk = []
+    path = channel_file_path(channel_id)
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 disk = json.load(f)
         except Exception:
             disk = []
-    # 単純結合でOK（簡易）
-    return disk + mem
+    return dedup(disk + mem)
 
 def remove_channel_disk(channel_id: int):
     path = channel_file_path(channel_id)
@@ -136,14 +141,12 @@ def remove_channel_disk(channel_id: int):
             pass
 
 def is_voice_like(ch: discord.abc.GuildChannel) -> bool:
-    # Voice / Stage で「テキストインボイス」にメッセージが来る
     return getattr(ch, "type", None) in (discord.ChannelType.voice, discord.ChannelType.stage_voice)
 
 def is_voice_message(message: discord.Message) -> bool:
     return getattr(message.channel, "type", None) in (discord.ChannelType.voice, discord.ChannelType.stage_voice)
 
 def fmt_record(rec: Dict) -> str:
-    # 1行テキストへ
     t = rec.get("ts")
     try:
         ts = datetime.fromisoformat(t).astimezone()
@@ -165,10 +168,7 @@ def fmt_record(rec: Dict) -> str:
     return base
 
 def build_txt(parts: List[Dict]) -> str:
-    lines = []
-    for r in parts:
-        lines.append(fmt_record(r))
-    return "\n".join(lines)
+    return "\n".join(fmt_record(r) for r in parts)
 
 async def send_chunked_logs(
     guild: discord.Guild,
@@ -188,11 +188,14 @@ async def send_chunked_logs(
             log.warning("指定のログチャンネルが見つかりません: %s", dest_channel_id)
             return
 
-    # TXT化 & 分割（Discord8MB想定。安全のため ~7.5MB）
+    # 念のためここでも重複排除（保険）
+    all_records = dedup(all_records)
+
+    # TXT化 & 分割（Discord上限対策）
     text = build_txt(all_records)
     raw = text.encode("utf-8", errors="ignore")
     MAX = 7_500_000
-    chunks = math.ceil(len(raw) / MAX) if raw else 1
+    chunks = max(1, math.ceil(len(raw) / MAX)) if raw else 1
 
     header = (
         f"🔔 **VCテキストログ（チャンネル削除検知）**\n"
@@ -201,7 +204,6 @@ async def send_chunked_logs(
         f"- 総メッセージ: {len(all_records)} 件\n"
         f"- 生成: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
     )
-
     await dest.send(header)
 
     if not raw:
@@ -219,11 +221,10 @@ async def send_chunked_logs(
 @bot.event
 async def on_ready():
     load_settings()
-    # ギルド即時反映（開発のしやすさのため）
+    # ギルド即時反映
     if GUILD_IDS:
         for gid in GUILD_IDS:
             try:
-                g = bot.get_guild(gid) or await bot.fetch_guild(gid)
                 await tree.sync(guild=discord.Object(id=gid))
                 log.info("Slash commands synced for guild %s", gid)
             except Exception as e:
@@ -235,13 +236,13 @@ async def on_ready():
         except Exception as e:
             log.warning("Global sync failed: %s", e)
     log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+    log.info("intents: message_content=%s, members=%s, presences=%s, guilds=%s",
+             intents.message_content, getattr(intents, 'members', False), getattr(intents, 'presences', False), intents.guilds)
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Bot自身は無視
     if message.author.bot:
         return
-    # VCテキストのみ対象
     if not is_voice_message(message):
         return
 
@@ -255,20 +256,15 @@ async def on_message(message: discord.Message):
         "deleted": False,
         "message_id": str(message.id),
     }
-
-    # メモリバッファ
     vc_text_buffer.setdefault(message.channel.id, []).append(rec)
-
-    # ディスク追記
     append_message_to_disk(message.channel.id, rec)
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
     if not is_voice_message(after):
         return
-    # 「編集済み」の痕跡を残す（完全同期はせず、簡易に別レコード追加）
     rec = {
-        "ts": after.edited_at.astimezone().isoformat() if after.edited_at else datetime.now().astimezone().isoformat(),
+        "ts": (after.edited_at or datetime.now().astimezone()).isoformat(),
         "author_id": str(after.author.id),
         "author_name": f"{after.author.display_name}",
         "content": f"(編集後) {after.content or ''}",
@@ -287,7 +283,7 @@ async def on_message_delete(message: discord.Message):
     rec = {
         "ts": datetime.now().astimezone().isoformat(),
         "author_id": str(message.author.id) if message.author else "unknown",
-        "author_name": f"{getattr(message.author, 'display_name', 'unknown')}",
+        "author_name": getattr(message.author, "display_name", "unknown"),
         "content": "(このメッセージは削除されました)",
         "attachments": [],
         "edited": False,
@@ -299,25 +295,20 @@ async def on_message_delete(message: discord.Message):
 
 @bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
-    # 対象はVC / Stageのみ
     if not is_voice_like(channel):
         return
     guild = channel.guild
     conf = guild_conf(guild.id)
 
-    # 直前までの記録を集める（ディスク＋メモリ）
     all_records = load_channel_records(channel.id)
-
-    # もし設定で上限があれば末尾側だけ残す
+    # 上限適用
     max_keep = int(conf.get("max_messages_per_channel", 5000))
     if len(all_records) > max_keep:
         all_records = all_records[-max_keep:]
 
-    # 送信
     try:
         await send_chunked_logs(guild, conf.get("log_channel_id"), channel, all_records)
     finally:
-        # 後片付け
         vc_text_buffer.pop(channel.id, None)
         remove_channel_disk(channel.id)
 
@@ -355,18 +346,19 @@ class GuildConfGroup(app_commands.Group):
         )
 
     @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.command(name="purge_cache", description="全チャンネルの一時保存をクリア（削除イベント前にクリーンアップしたい場合）")
+    @app_commands.command(name="purge_cache", description="一時保存とJSONを全削除（重複が溜まったとき等に実行）")
     async def purge_cache(self, interaction: discord.Interaction):
         vc_text_buffer.clear()
-        # ディスクも掃除
+        # ディスク掃除
         for fn in os.listdir(DATA_DIR):
             if fn.endswith(".json") and fn != os.path.basename(SETTINGS_FILE):
                 try:
                     os.remove(os.path.join(DATA_DIR, fn))
                 except Exception:
                     pass
-        await interaction.response.send_message("🧹 一時保存をクリアしました。", ephemeral=True)
+        await interaction.response.send_message("🧹 一時保存とJSONをクリアしました。", ephemeral=True)
 
+# ギルド即時登録（PRIMARY_GUILD_IDがあれば）
 tree.add_command(GuildConfGroup(), guild=discord.Object(id=PRIMARY_GUILD_ID) if PRIMARY_GUILD_ID else None)
 
 # ========= 実行 =========

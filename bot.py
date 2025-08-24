@@ -2,9 +2,8 @@ import os
 import io
 import json
 import math
-import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, List, Optional
 
 import discord
@@ -14,8 +13,12 @@ from discord import app_commands
 # ========= 環境変数 =========
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # 必須
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# 即時反映したいサーバーIDをカンマ区切りで（例: "1398607685158440991,123..."）
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "1398607685158440991").split(",") if x.strip().isdigit()]
 PRIMARY_GUILD_ID = GUILD_IDS[0] if GUILD_IDS else None
+
+# ========= 権限ロール =========
+ALLOWED_ROLE_ID = 1398724601256874014  # ← このロール保持者のみコマンド使用可
 
 # ========= ログ =========
 logging.basicConfig(
@@ -30,8 +33,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
 # ========= Intents / Bot =========
+# 最小構成：VCテキスト（message_content）を読む
 intents = discord.Intents.default()
-intents.message_content = True   # ポータルで MESSAGE CONTENT をONに
+intents.message_content = True   # 開発者ポータルで MESSAGE CONTENT を ON に
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -42,16 +46,17 @@ tree = bot.tree
 #   guild_id: {
 #       "log_channel_id": int|None,
 #       "max_messages_per_channel": int,
-#       "category_whitelist": [int, ...],  # 追加：記録対象カテゴリーID（空=全VC）
+#       "category_whitelist": [int, ...],  # 記録対象カテゴリーID（空=全VC）
 #   }
 # }
 guild_settings: Dict[int, Dict] = {}
+# { channel_id: [ {ts, author_id, author_name, content, attachments, edited, deleted, message_id}, ... ] }
 vc_text_buffer: Dict[int, List[Dict]] = {}
 
 DEFAULT_SETTINGS = {
     "log_channel_id": None,
     "max_messages_per_channel": 5000,
-    "category_whitelist": [],  # ← 新規
+    "category_whitelist": [],
 }
 
 # ========= ユーティリティ =========
@@ -84,10 +89,8 @@ def guild_conf(guild_id: int) -> Dict:
         conf = DEFAULT_SETTINGS.copy()
         guild_settings[guild_id] = conf
         save_settings()
-    # 欠けキー埋め
     for k, v in DEFAULT_SETTINGS.items():
         conf.setdefault(k, v)
-    # 型整備
     if not isinstance(conf.get("category_whitelist"), list):
         conf["category_whitelist"] = []
     return conf
@@ -109,6 +112,7 @@ def append_message_to_disk(channel_id: int, record: Dict):
         log.exception("VCテキストの書き込み失敗: %s", e)
 
 def dedup(records: List[Dict]) -> List[Dict]:
+    """message_id / ts / content / edited / deleted をキーに重複排除"""
     seen = set()
     out = []
     for r in records:
@@ -126,6 +130,7 @@ def dedup(records: List[Dict]) -> List[Dict]:
     return out
 
 def load_channel_records(channel_id: int) -> List[Dict]:
+    """ディスク+メモリをマージし、重複除去して返す"""
     mem = vc_text_buffer.get(channel_id, [])
     disk = []
     path = channel_file_path(channel_id)
@@ -208,7 +213,7 @@ async def send_chunked_logs(
 
     text = build_txt(all_records)
     raw = text.encode("utf-8", errors="ignore")
-    MAX = 7_500_000
+    MAX = 7_500_000  # Discord添付分割の安全閾値
     chunks = max(1, math.ceil(len(raw) / MAX)) if raw else 1
 
     header = (
@@ -233,10 +238,20 @@ async def send_chunked_logs(
         buf.name = f"vc_text_{deleted_channel.id}_part{i+1}of{chunks}.txt"
         await dest.send(file=discord.File(buf))
 
+# ========= コマンド権限チェック =========
+def has_allowed_role():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        # メンバー情報がない場合は不可
+        if not interaction.user or not isinstance(interaction.user, discord.Member):
+            return False
+        return any(r.id == ALLOWED_ROLE_ID for r in interaction.user.roles)
+    return app_commands.check(predicate)
+
 # ========= イベント =========
 @bot.event
 async def on_ready():
     load_settings()
+    # ギルド即時反映
     if GUILD_IDS:
         for gid in GUILD_IDS:
             try:
@@ -283,7 +298,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     rec = {
         "ts": (after.edited_at or datetime.now().astimezone()).isoformat(),
         "author_id": str(after.author.id),
-        "author_name": f"{after.author.display_name}",
+        "author_name": f"{after.display_name if hasattr(after, 'display_name') else after.author.display_name}",
         "content": f"(編集後) {after.content or ''}",
         "attachments": [a.url for a in after.attachments] if after.attachments else [],
         "edited": True,
@@ -337,7 +352,7 @@ class GuildConfGroup(app_commands.Group):
     def __init__(self):
         super().__init__(name="vcchatlog", description="VCテキスト削除時ログの設定")
 
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @has_allowed_role()
     @app_commands.command(name="set_log_channel", description="ログ送信先チャンネルを設定")
     async def set_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         conf = guild_conf(interaction.guild_id)
@@ -345,7 +360,7 @@ class GuildConfGroup(app_commands.Group):
         save_settings()
         await interaction.response.send_message(f"✅ ログ送信先を {channel.mention} に設定しました。", ephemeral=True)
 
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @has_allowed_role()
     @app_commands.command(name="set_max", description="1チャンネルあたり保持する最大メッセージ数")
     async def set_max(self, interaction: discord.Interaction, count: app_commands.Range[int, 100, 200000] = 5000):
         conf = guild_conf(interaction.guild_id)
@@ -353,8 +368,8 @@ class GuildConfGroup(app_commands.Group):
         save_settings()
         await interaction.response.send_message(f"✅ 最大保持件数を {count} に設定しました。", ephemeral=True)
 
-    # ---- 新規: カテゴリー制御 ----
-    @app_commands.checks.has_permissions(manage_guild=True)
+    # ---- カテゴリー制御 ----
+    @has_allowed_role()
     @app_commands.command(name="add_category", description="記録対象カテゴリーを追加")
     async def add_category(self, interaction: discord.Interaction, category: discord.CategoryChannel):
         conf = guild_conf(interaction.guild_id)
@@ -367,7 +382,7 @@ class GuildConfGroup(app_commands.Group):
         else:
             await interaction.response.send_message(f"ℹ️ すでに追加済み: {category.name}", ephemeral=True)
 
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @has_allowed_role()
     @app_commands.command(name="remove_category", description="記録対象カテゴリーを削除")
     async def remove_category(self, interaction: discord.Interaction, category: discord.CategoryChannel):
         conf = guild_conf(interaction.guild_id)
@@ -380,7 +395,7 @@ class GuildConfGroup(app_commands.Group):
         else:
             await interaction.response.send_message(f"ℹ️ 見つかりませんでした: {category.name}", ephemeral=True)
 
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @has_allowed_role()
     @app_commands.command(name="list_categories", description="記録対象カテゴリーの一覧を表示")
     async def list_categories(self, interaction: discord.Interaction):
         conf = guild_conf(interaction.guild_id)
@@ -395,16 +410,15 @@ class GuildConfGroup(app_commands.Group):
             lines.append(f"- {name}（ID: {cid}）")
         await interaction.response.send_message("📄 記録対象カテゴリー:\n" + "\n".join(lines), ephemeral=True)
 
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @has_allowed_role()
     @app_commands.command(name="clear_categories", description="記録対象カテゴリーをすべて解除（全VC対象に戻す）")
     async def clear_categories(self, interaction: discord.Interaction):
         conf = guild_conf(interaction.guild_id)
         conf["category_whitelist"] = []
         save_settings()
         await interaction.response.send_message("🧹 クリアしました。以後は**全カテゴリー**が対象になります。", ephemeral=True)
-    # ---- ここまで新規 ----
 
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @has_allowed_role()
     @app_commands.command(name="status", description="現在の設定を表示")
     async def status(self, interaction: discord.Interaction):
         conf = guild_conf(interaction.guild_id)
@@ -426,7 +440,7 @@ class GuildConfGroup(app_commands.Group):
             ephemeral=True
         )
 
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @has_allowed_role()
     @app_commands.command(name="purge_cache", description="一時保存とJSONを全削除（重複が溜まったとき等）")
     async def purge_cache(self, interaction: discord.Interaction):
         vc_text_buffer.clear()

@@ -2,12 +2,14 @@ import os
 import io
 import json
 import math
+import gzip
+import asyncio
 import logging
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Any, Iterable
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 
 # ========= 環境変数 =========
@@ -19,6 +21,11 @@ PRIMARY_GUILD_ID = GUILD_IDS[0] if GUILD_IDS else None
 
 # ========= 権限ロール =========
 ALLOWED_ROLE_ID = 1398724601256874014  # ← このロール保持者のみコマンド使用可
+
+# ========= バックアップ関連 追加の環境変数 =========
+BACKUP_DIR = os.getenv("BACKUP_DIR", "./data/backups")
+REPORT_CHANNEL_ID = int(os.getenv("REPORT_CHANNEL_ID", "0"))  # 送信先テキストチャンネルID（未設定可）
+DEFAULT_MESSAGE_CHANNEL_IDS = os.getenv("BACKUP_MESSAGE_CHANNEL_IDS", "")  # カンマ区切り "123,456"
 
 # ========= ログ =========
 logging.basicConfig(
@@ -33,13 +40,20 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
 # ========= Intents / Bot =========
-# 最小構成：VCテキスト（message_content）を読む
+# 既存: VCテキスト（message_content）を読む
+# 追加: メンバー一覧バックアップのため members を True に
 intents = discord.Intents.default()
 intents.message_content = True   # 開発者ポータルで MESSAGE CONTENT を ON に
 intents.guilds = True
+intents.members = True           # 開発者ポータルで Server Members Intent を ON に
+intents.messages = True
+intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+
+# ========= タイムゾーン（JST） =========
+JST = timezone(timedelta(hours=9))
 
 # ========= 設定・状態 =========
 # guild_settings = {
@@ -59,7 +73,23 @@ DEFAULT_SETTINGS = {
     "category_whitelist": [],
 }
 
-# ========= ユーティリティ =========
+# ========= 共通ユーティリティ =========
+def parse_id_list(text: Optional[str]) -> List[int]:
+    if not text:
+        return []
+    out: List[int] = []
+    for part in text.replace(" ", "").split(","):
+        if part.isdigit():
+            out.append(int(part))
+    return out
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def jst_now_iso() -> str:
+    return datetime.now(JST).isoformat()
+
+# ========= 既存：VCテキスト保存関連 =========
 def channel_file_path(channel_id: int) -> str:
     return os.path.join(DATA_DIR, f"{channel_id}.json")
 
@@ -238,14 +268,247 @@ async def send_chunked_logs(
         buf.name = f"vc_text_{deleted_channel.id}_part{i+1}of{chunks}.txt"
         await dest.send(file=discord.File(buf))
 
-# ========= コマンド権限チェック =========
-def has_allowed_role():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        # メンバー情報がない場合は不可
-        if not interaction.user or not isinstance(interaction.user, discord.Member):
-            return False
-        return any(r.id == ALLOWED_ROLE_ID for r in interaction.user.roles)
-    return app_commands.check(predicate)
+# ========= バックアップ（スナップショット）機能 追加 =========
+
+def _ow_serialize(ow: Dict[Any, discord.PermissionOverwrite]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for target, perm in ow.items():
+        allow, deny = perm.pair()
+        out.append({
+            "type": "role" if isinstance(target, discord.Role) else "member",
+            "id": target.id,
+            "allow": allow.value,
+            "deny": deny.value
+        })
+    return out
+
+def _ch_serialize(ch: discord.abc.GuildChannel) -> Dict[str, Any]:
+    base = {
+        "id": ch.id,
+        "name": ch.name,
+        "type": str(ch.type),
+        "position": getattr(ch, "position", 0),
+        "nsfw": getattr(ch, "nsfw", False),
+        "overwrites": _ow_serialize(ch.overwrites),
+        "topic": getattr(ch, "topic", None),
+        "parent_id": ch.category_id if hasattr(ch, "category_id") else None,
+        "extra": {}
+    }
+    if isinstance(ch, discord.TextChannel):
+        base["extra"] = {"slowmode_delay": ch.slowmode_delay, "default_thread_auto_archive_duration": ch.default_auto_archive_duration}
+    elif isinstance(ch, discord.VoiceChannel):
+        base["extra"] = {"bitrate": ch.bitrate, "user_limit": ch.user_limit}
+    elif isinstance(ch, discord.ForumChannel):
+        base["extra"] = {"default_thread_slowmode_delay": ch.default_thread_slowmode_delay}
+    return base
+
+async def dump_guild_structure(guild: discord.Guild) -> Dict[str, Any]:
+    roles = [
+        {
+            "id": r.id, "name": r.name, "color": r.color.value, "hoist": r.hoist,
+            "managed": r.managed, "mentionable": r.mentionable,
+            "permissions": r.permissions.value, "position": r.position
+        }
+        for r in sorted(guild.roles, key=lambda x: x.position, reverse=False)
+    ]
+
+    categories = []
+    for cat in sorted([c for c in guild.channels if isinstance(c, discord.CategoryChannel)], key=lambda x: x.position):
+        cat_data = {
+            "id": cat.id,
+            "name": cat.name,
+            "position": cat.position,
+            "overwrites": _ow_serialize(cat.overwrites),
+            "children": []
+        }
+        for ch in sorted(cat.channels, key=lambda x: x.position):
+            cat_data["children"].append(_ch_serialize(ch))
+        categories.append(cat_data)
+
+    uncategorized = [
+        _ch_serialize(ch)
+        for ch in sorted(guild.channels, key=lambda x: getattr(x, "position", 0))
+        if ch.category is None and not isinstance(ch, discord.CategoryChannel)
+    ]
+
+    return {
+        "meta": {
+            "guild_id": guild.id,
+            "guild_name": guild.name,
+            "icon_url": guild.icon.url if guild.icon else None,
+            "preferred_locale": guild.preferred_locale,
+            "afk_timeout": guild.afk_timeout,
+            "verification_level": str(guild.verification_level),
+            "system_channel_id": guild.system_channel.id if guild.system_channel else None,
+            "rules_channel_id": guild.rules_channel.id if guild.rules_channel else None,
+            "public_updates_channel_id": guild.public_updates_channel.id if guild.public_updates_channel else None,
+            "exported_at": jst_now_iso(),
+        },
+        "roles": roles,
+        "categories": categories,
+        "uncategorized_channels": uncategorized,
+    }
+
+async def dump_members(guild: discord.Guild) -> List[Dict[str, Any]]:
+    members: List[Dict[str, Any]] = []
+    async for m in guild.fetch_members(limit=None):
+        members.append({
+            "id": m.id,
+            "name": m.name,
+            "global_name": m.global_name,
+            "display_name": m.display_name,
+            "discriminator": m.discriminator,
+            "bot": m.bot,
+            "roles": [r.id for r in m.roles if r.name != "@everyone"],
+            "joined_at": m.joined_at.astimezone(JST).isoformat() if m.joined_at else None,
+            "premium_since": m.premium_since.astimezone(JST).isoformat() if m.premium_since else None,
+        })
+    return members
+
+def _serialize_message(msg: discord.Message) -> Dict[str, Any]:
+    return {
+        "id": msg.id,
+        "channel_id": msg.channel.id if msg.channel else None,
+        "author_id": msg.author.id if msg.author else None,
+        "author_name": getattr(msg.author, "name", None),
+        "author_discriminator": getattr(msg.author, "discriminator", None),
+        "content": msg.content,
+        "created_at": msg.created_at.astimezone(JST).isoformat(),
+        "edited_at": msg.edited_at.astimezone(JST).isoformat() if msg.edited_at else None,
+        "mentions": [u.id for u in msg.mentions],
+        "role_mentions": [r.id for r in msg.role_mentions],
+        "attachments": [
+            {"url": a.url, "filename": a.filename, "size": a.size, "content_type": a.content_type}
+            for a in msg.attachments
+        ],
+        "embeds": [e.to_dict() for e in msg.embeds],
+        "reactions": [
+            {"emoji": str(r.emoji), "count": r.count, "me": r.me}
+            for r in msg.reactions
+        ],
+        "reference": ({
+            "message_id": msg.reference.message_id,
+            "channel_id": msg.reference.channel_id,
+            "guild_id": msg.reference.guild_id,
+            "type": msg.reference.type.name if msg.reference.type else None
+        } if msg.reference else None)
+    }
+
+async def append_jsonl(path: str, obj: Dict[str, Any]):
+    ensure_dir(os.path.dirname(path))
+    line = json.dumps(obj, ensure_ascii=False)
+    with gzip.open(path, "at", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+async def write_json(path: str, data: Any):
+    ensure_dir(os.path.dirname(path))
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+async def dump_messages_for_channels(guild: discord.Guild, since_utc: datetime, channel_ids: Iterable[int], base_dir: str) -> Dict[int, int]:
+    """
+    指定チャンネルIDのみ、since_utc 以降のメッセージを JSONL.GZ で書き出す。
+    return: {channel_id: dumped_count}
+    """
+    ensure_dir(base_dir)
+    dumped: Dict[int, int] = {}
+
+    id_to_textch: Dict[int, discord.TextChannel] = {c.id: c for c in guild.text_channels}
+
+    for cid in channel_ids:
+        ch = id_to_textch.get(cid)
+        if not ch:
+            log.warning(f"channel id {cid} not found or not a TextChannel in guild {guild.id}")
+            continue
+        if not ch.permissions_for(guild.me).read_messages:
+            log.warning(f"no read permission for #{ch.name} ({cid})")
+            continue
+
+        path = os.path.join(base_dir, f"messages-{cid}.jsonl.gz")
+        count = 0
+        async for msg in ch.history(limit=None, after=since_utc, oldest_first=True):
+            await append_jsonl(path, _serialize_message(msg))
+            count += 1
+            if count % 1000 == 0:
+                await asyncio.sleep(0)
+        dumped[cid] = count
+        log.info(f"dumped {count} messages from #{ch.name} ({cid})")
+
+    return dumped
+
+def snapshot_dir_for(guild_id: int) -> str:
+    stamp = datetime.now(JST).strftime("%Y%m%d-%H%M%SJST")
+    return os.path.join(BACKUP_DIR, str(guild_id), stamp)
+
+async def create_snapshot(guild: discord.Guild, message_channel_ids: List[int]) -> str:
+    snap_dir = snapshot_dir_for(guild.id)
+    ensure_dir(snap_dir)
+
+    # 1) 構造
+    structure = await dump_guild_structure(guild)
+    await write_json(os.path.join(snap_dir, "guild.json.gz"), structure)
+
+    # 2) メンバー
+    members = await dump_members(guild)
+    await write_json(os.path.join(snap_dir, "members.json.gz"), members)
+
+    # 3) メッセージ（過去7日）
+    since_utc = datetime.now(timezone.utc) - timedelta(days=7)
+    msg_dir = os.path.join(snap_dir, "messages")
+    dumped = await dump_messages_for_channels(guild, since_utc, message_channel_ids, msg_dir)
+
+    # 4) マニフェスト
+    manifest = {
+        "guild_id": guild.id,
+        "guild_name": guild.name,
+        "exported_at": jst_now_iso(),
+        "message_channels": message_channel_ids,
+        "message_counts": dumped,
+    }
+    await write_json(os.path.join(snap_dir, "manifest.json.gz"), manifest)
+
+    return snap_dir
+
+async def send_snapshot_summary(guild: discord.Guild, target: discord.abc.MessageableChannel | app_commands.CommandTree, snap_dir: str, via_followup: Optional[discord.Webhook] = None):
+    """
+    guild.json.gz / members.json.gz / manifest.json.gz と messages/*.jsonl.gz を分割送信。
+    interaction.followup を渡すとフォローアップ送信、チャンネルなら通常送信。
+    """
+    # 収集
+    def collect_files() -> List[str]:
+        files = []
+        for root, _, filenames in os.walk(snap_dir):
+            for fn in filenames:
+                if fn.endswith(".gz"):
+                    files.append(os.path.join(root, fn))
+        return files
+
+    files = collect_files()
+    head = [p for p in files if p.endswith("guild.json.gz") or p.endswith("members.json.gz") or p.endswith("manifest.json.gz")]
+    msg_files = [p for p in files if "/messages/" in p.replace("\\", "/")]
+
+    header = f"📦 週次スナップショットを作成しました\n- Guild: **{guild.name}** ({guild.id})\n- Path: `{snap_dir}`"
+
+    async def send_fn(content: Optional[str] = None, filepaths: Optional[List[str]] = None):
+        if via_followup is not None:
+            if filepaths:
+                await via_followup.send(content or discord.utils.MISSING, files=[discord.File(p, filename=os.path.basename(p)) for p in filepaths])
+            else:
+                await via_followup.send(content or discord.utils.MISSING)
+        else:
+            if isinstance(target, discord.abc.Messageable):
+                if filepaths:
+                    await target.send(content or discord.utils.MISSING, files=[discord.File(p, filename=os.path.basename(p)) for p in filepaths])
+                else:
+                    await target.send(content or discord.utils.MISSING)
+
+    await send_fn(header, head[:10])
+
+    CHUNK = 10
+    for i in range(0, len(msg_files), CHUNK):
+        chunk = msg_files[i:i+CHUNK]
+        await send_fn(f"messages part {i//CHUNK + 1}", chunk)
+        await asyncio.sleep(1.0)
 
 # ========= イベント =========
 @bot.event
@@ -265,6 +528,11 @@ async def on_ready():
             log.info("Global slash commands synced")
         except Exception as e:
             log.warning("Global sync failed: %s", e)
+
+    ensure_dir(BACKUP_DIR)
+    if not weekly_backup_task.is_running():
+        weekly_backup_task.start()
+
     log.info("Logged in as %s (%s)", bot.user, bot.user.id)
 
 @bot.event
@@ -348,6 +616,13 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
         remove_channel_disk(channel.id)
 
 # ========= コマンド =========
+def has_allowed_role():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not interaction.user or not isinstance(interaction.user, discord.Member):
+            return False
+        return any(r.id == ALLOWED_ROLE_ID for r in interaction.user.roles)
+    return app_commands.check(predicate)
+
 class GuildConfGroup(app_commands.Group):
     def __init__(self):
         super().__init__(name="vcchatlog", description="VCテキスト削除時ログの設定")
@@ -454,6 +729,67 @@ class GuildConfGroup(app_commands.Group):
 
 # ギルド即時登録（PRIMARY_GUILD_IDがあれば）
 tree.add_command(GuildConfGroup(), guild=discord.Object(id=PRIMARY_GUILD_ID) if PRIMARY_GUILD_ID else None)
+
+# ---- バックアップ用コマンド ----
+class BackupGroup(app_commands.Group):
+    def __init__(self):
+        super().__init__(name="backup", description="サーバーバックアップ（スナップショット出力と送信）")
+
+    @has_allowed_role()
+    @app_commands.command(name="now", description="今すぐスナップショットを作成して送信（チャンネルIDはカンマ区切り）")
+    @app_commands.describe(channels="例: 123,456（省略時は環境変数 BACKUP_MESSAGE_CHANNEL_IDS を使用）")
+    async def backup_now(self, interaction: discord.Interaction, channels: Optional[str] = None):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.followup.send("ギルド内で実行してください。", ephemeral=True)
+
+        ch_ids = parse_id_list(channels) or parse_id_list(DEFAULT_MESSAGE_CHANNEL_IDS)
+        snap_dir = await create_snapshot(guild, ch_ids)
+
+        # 送信先：REPORT_CHANNEL_ID があればそちら、なければ実行チャンネル
+        target_channel = guild.get_channel(REPORT_CHANNEL_ID) if REPORT_CHANNEL_ID else None
+        via_followup = interaction.followup  # 実行者へも送る
+        await send_snapshot_summary(guild, target_channel or interaction.channel, snap_dir, via_followup=via_followup)
+        await interaction.followup.send("✅ スナップショット送信を完了しました。", ephemeral=True)
+
+    @has_allowed_role()
+    @app_commands.command(name="status", description="バックアップ設定の確認")
+    async def backup_status(self, interaction: discord.Interaction):
+        chs = parse_id_list(DEFAULT_MESSAGE_CHANNEL_IDS)
+        rep = f"<#{REPORT_CHANNEL_ID}>" if REPORT_CHANNEL_ID else "未設定（実行チャンネルに送信）"
+        await interaction.response.send_message(
+            "🧾 **バックアップ設定**\n"
+            f"- BACKUP_DIR: `{BACKUP_DIR}`\n"
+            f"- REPORT_CHANNEL_ID: {rep}\n"
+            f"- BACKUP_MESSAGE_CHANNEL_IDS: {', '.join(map(str, chs)) if chs else '（未設定）'}\n"
+            f"- 週次スケジュール: 毎週 月曜 04:00 JST（±10分枠）",
+            ephemeral=True
+        )
+
+tree.add_command(BackupGroup(), guild=discord.Object(id=PRIMARY_GUILD_ID) if PRIMARY_GUILD_ID else None)
+
+# ========= 週次スケジュール（JST・毎週月曜 04:00 ±10分） =========
+@tasks.loop(minutes=10.0)
+async def weekly_backup_task():
+    now = datetime.now(JST)
+    if now.weekday() == 0 and now.hour == 4 and now.minute < 10:
+        for guild in bot.guilds:
+            try:
+                ch_ids = parse_id_list(DEFAULT_MESSAGE_CHANNEL_IDS)
+                snap_dir = await create_snapshot(guild, ch_ids)
+                # 送信先
+                target_channel = guild.get_channel(REPORT_CHANNEL_ID) if REPORT_CHANNEL_ID else None
+                if target_channel is None:
+                    target_channel = guild.system_channel or (guild.text_channels[0] if guild.text_channels else None)
+                if target_channel:
+                    await send_snapshot_summary(guild, target_channel, snap_dir)
+            except Exception as e:
+                log.exception(f"weekly backup failed for {guild.id}: {e}")
+
+@weekly_backup_task.before_loop
+async def before_weekly():
+    await bot.wait_until_ready()
 
 # ========= 実行 =========
 if __name__ == "__main__":

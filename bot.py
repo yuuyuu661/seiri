@@ -15,17 +15,18 @@ from discord import app_commands
 # ========= 環境変数 =========
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # 必須
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
 # 即時反映したいサーバーIDをカンマ区切りで（例: "1398607685158440991,123..."）
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "1398607685158440991").split(",") if x.strip().isdigit()]
 PRIMARY_GUILD_ID = GUILD_IDS[0] if GUILD_IDS else None
 
-# ========= 権限ロール =========
-ALLOWED_ROLE_ID = 1398724601256874014  # ← このロール保持者のみコマンド使用可
+# ========= 権限ロール（このロール保持者のみ設定系/バックアップ系コマンドを使える） =========
+ALLOWED_ROLE_ID = int(os.getenv("ALLOWED_ROLE_ID", "1398724601256874014"))
 
-# ========= バックアップ関連 追加の環境変数 =========
+# ========= バックアップ関連 環境変数 =========
 BACKUP_DIR = os.getenv("BACKUP_DIR", "./data/backups")
-REPORT_CHANNEL_ID = int(os.getenv("REPORT_CHANNEL_ID", "0"))  # 送信先テキストチャンネルID（未設定可）
-DEFAULT_MESSAGE_CHANNEL_IDS = os.getenv("BACKUP_MESSAGE_CHANNEL_IDS", "")  # カンマ区切り "123,456"
+REPORT_CHANNEL_ID = int(os.getenv("REPORT_CHANNEL_ID", "0"))  # スナップショット送信先チャンネルID（未設定可）
+DEFAULT_MESSAGE_CHANNEL_IDS = os.getenv("BACKUP_MESSAGE_CHANNEL_IDS", "")  # 例: "123,456"
 
 # ========= ログ =========
 logging.basicConfig(
@@ -40,12 +41,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
 # ========= Intents / Bot =========
-# 既存: VCテキスト（message_content）を読む
-# 追加: メンバー一覧バックアップのため members を True に
 intents = discord.Intents.default()
-intents.message_content = True   # 開発者ポータルで MESSAGE CONTENT を ON に
+intents.message_content = True   # 開発者ポータルで MESSAGE CONTENT を ON
 intents.guilds = True
-intents.members = True           # 開発者ポータルで Server Members Intent を ON に
+intents.members = True           # メンバー一覧バックアップのため Server Members Intent を ON
 intents.messages = True
 intents.reactions = True
 
@@ -268,7 +267,7 @@ async def send_chunked_logs(
         buf.name = f"vc_text_{deleted_channel.id}_part{i+1}of{chunks}.txt"
         await dest.send(file=discord.File(buf))
 
-# ========= バックアップ（スナップショット）機能 追加 =========
+# ========= バックアップ（スナップショット）機能 =========
 
 def _ow_serialize(ow: Dict[Any, discord.PermissionOverwrite]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -469,14 +468,19 @@ async def create_snapshot(guild: discord.Guild, message_channel_ids: List[int]) 
 
     return snap_dir
 
-async def send_snapshot_summary(guild: discord.Guild, target: discord.abc.MessageableChannel | app_commands.CommandTree, snap_dir: str, via_followup: Optional[discord.Webhook] = None):
+async def send_snapshot_summary(
+    guild: discord.Guild,
+    target: Optional[discord.abc.Messageable],   # ← 型修正済み
+    snap_dir: str,
+    via_followup: Optional[discord.Webhook] = None
+):
     """
     guild.json.gz / members.json.gz / manifest.json.gz と messages/*.jsonl.gz を分割送信。
-    interaction.followup を渡すとフォローアップ送信、チャンネルなら通常送信。
+    via_followup（interaction.followup）を渡すと実行者にも送信。
+    target が None の場合はチャンネル送信をスキップ。
     """
-    # 収集
     def collect_files() -> List[str]:
-        files = []
+        files: List[str] = []
         for root, _, filenames in os.walk(snap_dir):
             for fn in filenames:
                 if fn.endswith(".gz"):
@@ -490,17 +494,20 @@ async def send_snapshot_summary(guild: discord.Guild, target: discord.abc.Messag
     header = f"📦 週次スナップショットを作成しました\n- Guild: **{guild.name}** ({guild.id})\n- Path: `{snap_dir}`"
 
     async def send_fn(content: Optional[str] = None, filepaths: Optional[List[str]] = None):
+        # 実行者へのフォローアップ
         if via_followup is not None:
             if filepaths:
-                await via_followup.send(content or discord.utils.MISSING, files=[discord.File(p, filename=os.path.basename(p)) for p in filepaths])
+                await via_followup.send(content or discord.utils.MISSING,
+                                        files=[discord.File(p, filename=os.path.basename(p)) for p in filepaths])
             else:
                 await via_followup.send(content or discord.utils.MISSING)
-        else:
-            if isinstance(target, discord.abc.Messageable):
-                if filepaths:
-                    await target.send(content or discord.utils.MISSING, files=[discord.File(p, filename=os.path.basename(p)) for p in filepaths])
-                else:
-                    await target.send(content or discord.utils.MISSING)
+        # チャンネルへ
+        if target is not None:
+            if filepaths:
+                await target.send(content or discord.utils.MISSING,
+                                  files=[discord.File(p, filename=os.path.basename(p)) for p in filepaths])
+            else:
+                await target.send(content or discord.utils.MISSING)
 
     await send_fn(header, head[:10])
 
@@ -533,7 +540,7 @@ async def on_ready():
     if not weekly_backup_task.is_running():
         weekly_backup_task.start()
 
-    log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+    log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
 
 @bot.event
 async def on_message(message: discord.Message):
